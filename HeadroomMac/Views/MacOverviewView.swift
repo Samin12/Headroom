@@ -60,7 +60,7 @@ struct MacOverviewView: View {
                 if focusedProvider == nil {
                     apiTrackers
                 }
-                Text("Codex checks about every 15 seconds while active; failures back off. Claude Code reads its local status-line feed when the client reports it, so limits can lag. The optional Claude website source checks about every 30 seconds while active.")
+                Text("Codex checks about every 15 seconds while active; failures back off. Claude account limits refresh about once a minute. The optional Claude website source checks about every 30 seconds while active.")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(22)
         }
@@ -129,7 +129,7 @@ struct MacOverviewView: View {
                     .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(account.label).font(.title3.bold())
-                    Text("Claude Code status-line feed").font(.caption).foregroundStyle(.secondary)
+                    Text("Claude account limits").font(.caption).foregroundStyle(.secondary)
                 }
             }
             if let usage = account.usage, !usage.windows.isEmpty {

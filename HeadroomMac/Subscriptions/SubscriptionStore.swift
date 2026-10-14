@@ -30,9 +30,14 @@ final class SubscriptionStore: ObservableObject {
     @Published private(set) var hermesLabel: String?
     @Published private(set) var codexLabel = "Codex"
     @Published private(set) var claudeLabel = "Claude Code"
+    /// True after a direct Claude account reading fills the primary limits.
+    @Published private(set) var claudeAccountLimits = false
     private var extraFeeds: [String: ClaudeUsageFeed] = [:]
     private var extraTimestamps: [String: Date] = [:]
     private var nextGrokRefresh = Date.distantPast
+    private var nextClaudeOAuth = Date.distantPast
+    private var claudeOAuthInFlight = false
+    private var claudeOAuthAgain = false
     private var codexHome: URL?
     private let connectedExtraKey = "subscription.claude.extra.connected"
     private let defaults = HeadroomPreferences.defaults
@@ -75,6 +80,7 @@ final class SubscriptionStore: ObservableObject {
             if self.claudeConnected && !self.claudeUsesWebsite { self.readClaude() }
             self.readExtraClaude()
             self.maybeRefreshGrok()
+            self.maybeRefreshClaudeOAuth()
             if self.claudeUsesWebsite { self.claudeWebsite.tick() }
             Task { await self.refresh(forced: false) }
         }
@@ -111,9 +117,11 @@ final class SubscriptionStore: ObservableObject {
             claude = SubscriptionFixtures.claudeCode(at: anchor)
             codexMessage = nil
             claudeMessage = nil
+            claudeAccountLimits = false
         } else {
             isSyntheticMode = false
             codex = nil; claude = nil
+            claudeAccountLimits = false
             setSuspended(false)
         }
     }
@@ -123,7 +131,7 @@ final class SubscriptionStore: ObservableObject {
         suspended = value
         claudeWebsite.setEnabled(claudeUsesWebsite && !value && !sleeping)
         generation += 1
-        if value { codex = nil; claude = nil; lastClaudeTimestamp = nil }
+        if value { codex = nil; claude = nil; lastClaudeTimestamp = nil; claudeAccountLimits = false }
         else {
             schedule.resume()
             Task { await refresh() }
@@ -193,6 +201,7 @@ final class SubscriptionStore: ObservableObject {
         claudeConnected = false
         defaults.set(false, forKey: "subscription.claude.connected")
         claude = nil
+        claudeAccountLimits = false
         claudeMessage = "Deleting Headroom’s local Claude sign-in session…"
         var feedCleanupFailed = false
         do {
@@ -218,6 +227,7 @@ final class SubscriptionStore: ObservableObject {
         if claudeConnected && !claudeUsesWebsite { readClaude() }
         readExtraClaude()
         maybeRefreshGrok(force: true)
+        maybeRefreshClaudeOAuth(force: forced)
         if claudeUsesWebsite { claudeWebsite.tick(force: forced) }
         if codexConnected, schedule.begin(at: Date(), forced: forced) {
             refreshing = true
@@ -250,7 +260,12 @@ final class SubscriptionStore: ObservableObject {
             return isClaude ? (claudeUsesWebsite ? "Claude website update delayed" : "Awaiting fresh Claude Code data") : "Last known reading · refresh delayed"
         }
         if !usage.isComplete { return "Partial reading · some limits unavailable" }
-        return isClaude ? (claudeUsesWebsite ? "Checked Claude account usage" : "Claude Code feed received") : "Checked with Codex"
+        if isClaude {
+            if claudeUsesWebsite { return "Checked Claude account usage" }
+            if claudeAccountLimits { return "Checked Claude account limits" }
+            return "Claude Code feed received"
+        }
+        return "Checked with Codex"
     }
 
     func openClaude() {
@@ -275,13 +290,12 @@ final class SubscriptionStore: ObservableObject {
     private func readClaude() {
         do {
             guard claudeFeed.isInstalled else {
-                claude = nil
-                claudeMessage = "Claude’s status line has changed. Disconnect and reconnect to bind the feed again."
+                noteClaudeWaiting("Reading Claude account limits…")
                 return
             }
             let feedURL = claudeFeed.feed
             guard FileManager.default.fileExists(atPath: feedURL.path) else {
-                claudeMessage = "Awaiting Claude Code. Open a signed-in session on this Mac; limits appear when Claude emits its status line. Requires Claude Code 2.1.80 or later."
+                noteClaudeWaiting("Reading Claude account limits…")
                 return
             }
             let attributes = try FileManager.default.attributesOfItem(atPath: feedURL.path)
@@ -290,9 +304,20 @@ final class SubscriptionStore: ObservableObject {
             guard timestamp != lastClaudeTimestamp else { return }
             let usage = try SubscriptionUsage.claude(Data(contentsOf: feedURL), now: timestamp)
             lastClaudeTimestamp = timestamp
+            // An empty status line must not replace account-limit bars.
+            guard !usage.windows.isEmpty else {
+                noteClaudeWaiting("Reading Claude account limits…")
+                return
+            }
             claude = usage
-            claudeMessage = usage.windows.isEmpty ? "Claude has not reported usable subscription limits yet. Use a Pro or Max session in Claude Code 2.1.80 or later. Context usage is not subscription usage." : nil
-        } catch { claudeMessage = error.localizedDescription }
+            claudeAccountLimits = false
+            claudeMessage = nil
+        } catch { noteClaudeWaiting(error.localizedDescription) }
+    }
+
+    private func noteClaudeWaiting(_ message: String) {
+        guard claude?.windows.isEmpty != false else { return }
+        claudeMessage = message
     }
 
     func connectDiscovered() async {
@@ -310,10 +335,11 @@ final class SubscriptionStore: ObservableObject {
         grokConnected = accounts.contains { $0.kind == .grok }
         defaults.set(grokConnected, forKey: "subscription.grok.connected")
         maybeRefreshGrok(force: true)
-        // Codex's rate-limit RPC can take the full timeout. Local accounts are already visible.
+        // Codex's rate-limit RPC can take the full timeout. Read Claude limits before that wait.
         if claudeHomes.contains(where: { $0.homePath == defaultHome }), !claudeConnected || claudeUsesWebsite {
             await connectClaude()
         }
+        maybeRefreshClaudeOAuth(force: true)
         if accounts.contains(where: { $0.kind == .codex }) {
             await connectCodex()
         }
@@ -378,15 +404,12 @@ final class SubscriptionStore: ObservableObject {
             guard let installed = extraFeeds[id] else { continue }
             do {
                 guard installed.isInstalled else {
-                    updateExtra(id) {
-                        $0.usage = nil
-                        $0.message = "Claude’s status line has changed. Connect T3 accounts again to bind this feed."
-                    }
+                    noteExtraWaiting(id, "Reading this Claude account’s limits…")
                     continue
                 }
                 let feedURL = installed.feed
                 guard FileManager.default.fileExists(atPath: feedURL.path) else {
-                    updateExtra(id) { $0.message = "Awaiting a signed-in Claude Code session for this account." }
+                    noteExtraWaiting(id, "Reading this Claude account’s limits…")
                     continue
                 }
                 let attributes = try FileManager.default.attributesOfItem(atPath: feedURL.path)
@@ -395,14 +418,23 @@ final class SubscriptionStore: ObservableObject {
                 guard timestamp != extraTimestamps[id] else { continue }
                 let usage = try SubscriptionUsage.claude(Data(contentsOf: feedURL), now: timestamp)
                 extraTimestamps[id] = timestamp
+                guard !usage.windows.isEmpty else {
+                    noteExtraWaiting(id, "Reading this Claude account’s limits…")
+                    continue
+                }
                 updateExtra(id) {
                     $0.usage = usage
-                    $0.message = usage.windows.isEmpty ? "This Claude account has not reported usable limits yet." : nil
+                    $0.message = nil
                 }
             } catch {
-                updateExtra(id) { $0.message = error.localizedDescription }
+                noteExtraWaiting(id, error.localizedDescription)
             }
         }
+    }
+
+    private func noteExtraWaiting(_ id: String, _ message: String) {
+        guard extraClaude.first(where: { $0.id == id })?.usage?.windows.isEmpty != false else { return }
+        updateExtra(id) { $0.message = message }
     }
 
     private func updateExtra(_ id: String, _ change: (inout ExtraClaudeAccount) -> Void) {
@@ -410,6 +442,74 @@ final class SubscriptionStore: ObservableObject {
         var account = extraClaude[index]
         change(&account)
         extraClaude[index] = account
+    }
+
+    private func maybeRefreshClaudeOAuth(force: Bool = false) {
+        guard !suspended, !sleeping, !isSyntheticMode else { return }
+        let now = Date()
+        guard force || now >= nextClaudeOAuth else { return }
+        if claudeOAuthInFlight {
+            if force { claudeOAuthAgain = true }
+            return
+        }
+        var targets: [ClaudeOAuthTarget] = []
+        if claudeConnected && !claudeUsesWebsite {
+            let home = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude", isDirectory: true)
+            targets.append(ClaudeOAuthTarget(id: home.standardizedFileURL.path, directory: home, primary: true))
+        }
+        for account in extraClaude where account.connected {
+            targets.append(ClaudeOAuthTarget(id: account.id, directory: URL(fileURLWithPath: account.id, isDirectory: true), primary: false))
+        }
+        guard !targets.isEmpty else { return }
+        nextClaudeOAuth = now.addingTimeInterval(60)
+        claudeOAuthInFlight = true
+        let requestGeneration = generation
+        Task.detached { [weak self] in
+            var readings: [ClaudeOAuthReading] = []
+            for target in targets {
+                do {
+                    let usage = try await ClaudeAccountUsageClient.read(configDirectory: target.directory)
+                    readings.append(ClaudeOAuthReading(id: target.id, primary: target.primary, usage: usage, message: nil))
+                } catch {
+                    let text = (error as? LocalizedError)?.errorDescription ?? "Claude account limits could not be read."
+                    readings.append(ClaudeOAuthReading(id: target.id, primary: target.primary, usage: nil, message: text))
+                }
+            }
+            await self?.applyClaudeOAuth(readings, generation: requestGeneration)
+        }
+    }
+
+    private func applyClaudeOAuth(_ readings: [ClaudeOAuthReading], generation requestGeneration: Int) {
+        claudeOAuthInFlight = false
+        let again = claudeOAuthAgain
+        claudeOAuthAgain = false
+        if !suspended, !sleeping, !isSyntheticMode, generation == requestGeneration {
+            for reading in readings {
+                if reading.primary {
+                    guard claudeConnected, !claudeUsesWebsite else { continue }
+                    if let usage = reading.usage, !usage.windows.isEmpty {
+                        claude = usage
+                        claudeMessage = nil
+                        claudeAccountLimits = true
+                    } else if claude?.windows.isEmpty != false {
+                        claudeMessage = reading.message ?? "Claude has not reported usable subscription limits yet."
+                    }
+                } else {
+                    guard extraClaude.contains(where: { $0.id == reading.id && $0.connected }) else { continue }
+                    if let usage = reading.usage, !usage.windows.isEmpty {
+                        updateExtra(reading.id) {
+                            $0.usage = usage
+                            $0.message = nil
+                        }
+                    } else if extraClaude.first(where: { $0.id == reading.id })?.usage?.windows.isEmpty != false {
+                        updateExtra(reading.id) {
+                            $0.message = reading.message ?? "This Claude account has not reported usable limits yet."
+                        }
+                    }
+                }
+            }
+        }
+        if again { maybeRefreshClaudeOAuth(force: true) }
     }
 
     private func maybeRefreshGrok(force: Bool = false) {
@@ -440,4 +540,17 @@ final class SubscriptionStore: ObservableObject {
         }
         return files
     }
+}
+
+private struct ClaudeOAuthTarget: Sendable {
+    let id: String
+    let directory: URL
+    let primary: Bool
+}
+
+private struct ClaudeOAuthReading: Sendable {
+    let id: String
+    let primary: Bool
+    let usage: SubscriptionUsage?
+    let message: String?
 }
