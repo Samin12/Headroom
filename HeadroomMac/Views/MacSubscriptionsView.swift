@@ -11,7 +11,7 @@ struct MacSubscriptionsView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Codex & Claude Code limits").font(.title2.bold())
-                    Text("Connect the coding subscriptions you use on this Mac.").foregroundStyle(.secondary)
+                    Text("Connect the coding subscriptions you use on this Mac, including every Claude account enabled in T3 Code.").foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("Refresh", systemImage: "arrow.clockwise") { Task { await store.refresh() } }
@@ -25,10 +25,25 @@ struct MacSubscriptionsView: View {
                         Label("Synthetic preview · connection actions are paused", systemImage: "flask")
                             .font(.caption).foregroundStyle(.orange)
                     }
+                    Button("Connect T3 Code accounts") { Task { await store.connectDiscovered() } }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(store.connectionsPaused || store.claudeDisconnecting)
+                    Text("Connects Codex, installs a separate Claude Code feed for each enabled T3 Claude home, and shows Grok’s local session cost. Hermes stays listed because it publishes no quota.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    ForEach(store.extraClaude) { account in
+                        GroupBox {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Label(account.label, systemImage: "brain.head.profile").font(.headline)
+                                Text(account.connected ? (account.message ?? "Feed installed. Limits appear when this account’s Claude Code session emits its status line.") : "Not connected")
+                                    .font(.callout).foregroundStyle(.secondary)
+                                if let usage = account.usage { quota(usage, isClaude: true, failed: account.message != nil) }
+                            }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
                     GroupBox {
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
-                                Label("Codex", systemImage: "terminal.fill").font(.headline)
+                                Label(store.codexLabel, systemImage: "terminal.fill").font(.headline)
                                 Spacer()
                                 if store.refreshing && store.codexConnected { ProgressView().controlSize(.small) }
                                 if store.codexConnected {
@@ -48,7 +63,7 @@ struct MacSubscriptionsView: View {
                     GroupBox {
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
-                                Label("Claude Code", systemImage: "brain.head.profile").font(.headline)
+                                Label(store.claudeLabel, systemImage: "brain.head.profile").font(.headline)
                                 Spacer()
                                 if store.claudeDisconnecting {
                                     ProgressView().controlSize(.small)
